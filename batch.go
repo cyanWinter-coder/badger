@@ -44,10 +44,17 @@ func (db *DB) NewWriteBatch() *WriteBatch {
 }
 
 func (db *DB) newWriteBatch(isManaged bool) *WriteBatch {
+	txn, err := db.newTransaction(true, isManaged)
+	if err != nil {
+		// newTransaction still returns a usable (non-nil) txn so the batch's
+		// Cancel/Discard paths remain valid; surface the shutdown failure through
+		// the batch error instead of dereferencing nil.
+		db.opt.Errorf("NewWriteBatch: %v", err)
+	}
 	return &WriteBatch{
 		db:        db,
 		isManaged: isManaged,
-		txn:       db.newTransaction(true, isManaged),
+		txn:       txn,
 		throttle:  y.NewThrottle(16),
 	}
 }
@@ -201,7 +208,14 @@ func (wb *WriteBatch) commit() error {
 		return err
 	}
 	wb.txn.CommitWith(wb.callback)
-	wb.txn = wb.db.newTransaction(true, wb.isManaged)
+	txn, err := wb.db.newTransaction(true, wb.isManaged)
+	if err != nil {
+		// Keep the (non-nil) txn for Cancel/Discard, and report the failure.
+		wb.txn = txn
+		wb.err.Store(err)
+		return wb.Error()
+	}
+	wb.txn = txn
 	wb.txn.commitTs = wb.commitTs
 	return wb.Error()
 }

@@ -80,18 +80,36 @@ func (o *oracle) readTs() uint64 {
 		panic("ReadTs should not be retrieved for managed DB")
 	}
 
-	var readTs uint64
-	o.Lock()
-	readTs = o.nextTxnTs - 1
-	o.readMark.Begin(readTs)
-	o.Unlock()
-
 	// Wait for all txns which have no conflicts, have been assigned a commit
 	// timestamp and are going through the write to value log and LSM tree
 	// process. Not waiting here could mean that some txns which have been
 	// committed would not be read.
-	y.Check(o.txnMark.WaitForMark(context.Background(), readTs))
+	readTs, err := o.readTsForTxn()
+	y.Check(err)
 	return readTs
+}
+
+// readTsForTxn allocates a snapshot timestamp for a new transaction. If the
+// database is closing while a caller is waiting for earlier commits to become
+// visible, the watermark wakes it up with y.ErrWaterMarkClosed instead of
+// blocking forever, and the read-mark begin acquired here is rolled back.
+func (o *oracle) readTsForTxn() (uint64, error) {
+	if o.isManaged {
+		panic("ReadTs should not be retrieved for managed DB")
+	}
+
+	o.Lock()
+	readTs := o.nextTxnTs - 1
+	o.readMark.Begin(readTs)
+	o.Unlock()
+
+	if err := o.txnMark.WaitForMark(context.Background(), readTs); err != nil {
+		// Roll back the readMark.Begin above so the watermark does not retain a
+		// dangling begin for a transaction the caller will never use.
+		o.readMark.Done(readTs)
+		return 0, err
+	}
+	return readTs, nil
 }
 
 func (o *oracle) nextTs() uint64 {
@@ -254,6 +272,10 @@ type Txn struct {
 	numIterators atomic.Int32
 	discarded    bool
 	doneRead     bool
+	// readMarkHeld reports whether the transaction owns an outstanding
+	// readMark.Begin that must be released with doneRead. It stays false for a
+	// transaction whose snapshot could not be acquired during DB shutdown.
+	readMarkHeld bool
 	update       bool // update is used to conditionally keep track of reads.
 }
 
@@ -352,6 +374,8 @@ func (txn *Txn) modify(e *Entry) error {
 	const maxKeySize = 65000
 
 	switch {
+	case txn.db.IsClosed():
+		return ErrDBClosed
 	case !txn.update:
 		return ErrReadOnlyTxn
 	case txn.discarded:
@@ -436,6 +460,8 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 		return nil, ErrEmptyKey
 	} else if txn.discarded {
 		return nil, ErrDiscardedTxn
+	} else if txn.db.IsClosed() {
+		return nil, ErrDBClosed
 	}
 
 	if err := txn.db.isBanned(key); err != nil {
@@ -505,6 +531,10 @@ func (txn *Txn) addReadKey(key []byte) {
 // this can safely be called via a defer right when transaction is created.
 //
 // NOTE: If any operations are run on a discarded transaction, ErrDiscardedTxn is returned.
+//
+// Discard is idempotent: repeated calls after the first are no-ops, and it is
+// safe to call on a transaction whose snapshot could not be acquired because
+// the database was closing.
 func (txn *Txn) Discard() {
 	if txn.discarded { // Avoid a re-run.
 		return
@@ -513,7 +543,9 @@ func (txn *Txn) Discard() {
 		panic("Unclosed iterator at time of Txn.Discard.")
 	}
 	txn.discarded = true
-	if !txn.db.orc.isManaged {
+	// readTsForTxn rolls back its readMark.Begin when it fails, so a transaction
+	// created while the DB was closing has no read watermark to release.
+	if !txn.db.orc.isManaged && txn.readMarkHeld {
 		txn.db.orc.doneRead(txn)
 	}
 }
@@ -607,6 +639,9 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 }
 
 func (txn *Txn) commitPrecheck() error {
+	if txn.db.IsClosed() {
+		return ErrDBClosed
+	}
 	if txn.discarded {
 		return errors.New("Trying to commit a discarded txn")
 	}
@@ -755,10 +790,19 @@ func (txn *Txn) ReadTs() uint64 {
 //	defer txn.Discard()
 //	// Call various APIs.
 func (db *DB) NewTransaction(update bool) *Txn {
-	return db.newTransaction(update, false)
+	txn, err := db.newTransaction(update, false)
+	if err != nil {
+		// Preserve the historical NewTransaction contract: never return an error
+		// (or nil). The only failure path here is the database closing while the
+		// snapshot timestamp was being acquired. The returned transaction carries
+		// no read watermark in that case and every operation on it fails with
+		// ErrDBClosed, matching the behavior of using a transaction after Close.
+		db.opt.Errorf("NewTransaction: %v", err)
+	}
+	return txn
 }
 
-func (db *DB) newTransaction(update, isManaged bool) *Txn {
+func (db *DB) newTransaction(update, isManaged bool) (*Txn, error) {
 	if db.opt.ReadOnly && update {
 		// DB is read-only, force read-only transaction.
 		update = false
@@ -777,9 +821,16 @@ func (db *DB) newTransaction(update, isManaged bool) *Txn {
 		txn.pendingWrites = make(map[string]*Entry)
 	}
 	if !isManaged {
-		txn.readTs = db.orc.readTs()
+		readTs, err := db.orc.readTsForTxn()
+		if err != nil {
+			// No readMark.Begin is retained on this path (readTsForTxn rolled it
+			// back), so Discard on the returned txn is a harmless no-op.
+			return txn, err
+		}
+		txn.readTs = readTs
+		txn.readMarkHeld = true
 	}
-	return txn
+	return txn, nil
 }
 
 // View executes a function creating and managing a read-only transaction for the user. Error

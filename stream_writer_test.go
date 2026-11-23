@@ -108,7 +108,8 @@ func TestStreamWriter2(t *testing.T) {
 			val := make([]byte, valueSize)
 			y.Check2(rand.Read(val))
 			for i := 0; i < noOfKeys; i++ {
-				txn := db.newTransaction(true, opts.managedTxns)
+				txn, err := db.newTransaction(true, opts.managedTxns)
+				require.NoError(t, err)
 				if opts.managedTxns {
 					txn.readTs = math.MaxUint64
 					txn.commitTs = maxVs
@@ -188,7 +189,8 @@ func TestStreamWriter3(t *testing.T) {
 			y.Check2(rand.Read(val))
 			counter = 1
 			for i := 0; i < noOfKeys; i++ {
-				txn := db.newTransaction(true, opts.managedTxns)
+				txn, err := db.newTransaction(true, opts.managedTxns)
+				require.NoError(t, err)
 				if opts.managedTxns {
 					txn.readTs = math.MaxUint64
 					txn.commitTs = maxVs

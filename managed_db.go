@@ -24,7 +24,12 @@ func (db *DB) NewTransactionAt(readTs uint64, update bool) *Txn {
 	if !db.opt.managedTxns {
 		panic("Cannot use NewTransactionAt with managedDB=false. Use NewTransaction instead.")
 	}
-	txn := db.newTransaction(update, true)
+	txn, err := db.newTransaction(update, true)
+	if err != nil {
+		// Managed transactions never acquire an oracle read timestamp, so this
+		// path is unreachable; keep the guard to satisfy the error-returning API.
+		panic(err)
+	}
 	txn.readTs = readTs
 	return txn
 }

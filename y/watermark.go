@@ -8,10 +8,16 @@ package y
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"sync/atomic"
 
 	"github.com/dgraph-io/ristretto/v2/z"
 )
+
+// ErrWaterMarkClosed is returned by WaitForMark when the WaterMark has been
+// stopped via its closer, so callers waiting on it can be woken up instead of
+// blocking forever while the database is shutting down.
+var ErrWaterMarkClosed = errors.New("Watermark has been closed")
 
 type uint64Heap []uint64
 
@@ -51,36 +57,81 @@ type mark struct {
 type WaterMark struct {
 	doneUntil atomic.Uint64
 	lastIndex atomic.Uint64
-	Name      string
-	markCh    chan mark
+	// closed is set to 1 once the closer has been signaled. Once closed, Begin
+	// and Done become no-ops and WaitForMark returns ErrWaterMarkClosed.
+	closed atomic.Bool
+	Name   string
+	markCh chan mark
+	// closeCh is closed when the closer passed to Init is signaled. Senders use
+	// it as an escape hatch so a full markCh can never block shutdown.
+	closeCh <-chan struct{}
+}
+
+// isClosed reports whether the watermark's processing goroutine has been (or is
+// being) shut down.
+func (w *WaterMark) isClosed() bool {
+	return w.closed.Load()
 }
 
 // Init initializes a WaterMark struct. MUST be called before using it.
 func (w *WaterMark) Init(closer *z.Closer) {
 	w.markCh = make(chan mark, 100)
+	w.closeCh = closer.HasBeenClosed()
 	go w.process(closer)
 }
 
 // Begin sets the last index to the given value.
 func (w *WaterMark) Begin(index uint64) {
+	if w.isClosed() {
+		return
+	}
 	w.lastIndex.Store(index)
-	w.markCh <- mark{index: index, done: false}
+	select {
+	case w.markCh <- mark{index: index, done: false}:
+	case <-w.closerDone():
+	}
 }
 
 // BeginMany works like Begin but accepts multiple indices.
 func (w *WaterMark) BeginMany(indices []uint64) {
+	if w.isClosed() {
+		return
+	}
 	w.lastIndex.Store(indices[len(indices)-1])
-	w.markCh <- mark{index: 0, indices: indices, done: false}
+	select {
+	case w.markCh <- mark{index: 0, indices: indices, done: false}:
+	case <-w.closerDone():
+	}
 }
 
 // Done sets a single index as done.
 func (w *WaterMark) Done(index uint64) {
-	w.markCh <- mark{index: index, done: true}
+	if w.isClosed() {
+		return
+	}
+	select {
+	case w.markCh <- mark{index: index, done: true}:
+	case <-w.closerDone():
+	}
 }
 
 // DoneMany works like Done but accepts multiple indices.
 func (w *WaterMark) DoneMany(indices []uint64) {
-	w.markCh <- mark{index: 0, indices: indices, done: true}
+	if w.isClosed() {
+		return
+	}
+	select {
+	case w.markCh <- mark{index: 0, indices: indices, done: true}:
+	case <-w.closerDone():
+	}
+}
+
+// closerDone returns a channel that is closed when the processing goroutine is
+// shutting down. WaterMark doesn't own the closer (it is shared across the
+// database's background goroutines), so it keeps a reference to it through the
+// channel passed to Init.
+func (w *WaterMark) closerDone() <-chan struct{} {
+	return w.closeCh
 }
 
 // DoneUntil returns the maximum index that has the property that all indices
@@ -100,19 +151,31 @@ func (w *WaterMark) LastIndex() uint64 {
 	return w.lastIndex.Load()
 }
 
-// WaitForMark waits until the given index is marked as done.
+// WaitForMark waits until the given index is marked as done. If the WaterMark
+// is closed (typically because the database is shutting down) before the index
+// is reached, ErrWaterMarkClosed is returned; callers waiting on the mark are
+// woken up instead of blocking forever.
 func (w *WaterMark) WaitForMark(ctx context.Context, index uint64) error {
 	if w.DoneUntil() >= index {
 		return nil
 	}
+	if w.isClosed() {
+		return ErrWaterMarkClosed
+	}
 	waitCh := make(chan struct{})
-	w.markCh <- mark{index: index, waiter: waitCh}
+	select {
+	case w.markCh <- mark{index: index, waiter: waitCh}:
+	case <-w.closerDone():
+		return ErrWaterMarkClosed
+	}
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-waitCh:
 		return nil
+	case <-w.closerDone():
+		return ErrWaterMarkClosed
 	}
 }
 
@@ -202,6 +265,10 @@ func (w *WaterMark) process(closer *z.Closer) {
 	for {
 		select {
 		case <-closer.HasBeenClosed():
+			// Mark the watermark as closed first, so concurrent Begin/Done calls
+			// stop enqueueing and new WaitForMark callers fail fast.
+			w.closed.Store(true)
+			w.drainAndWakeup(processOne, waiters)
 			return
 		case mark := <-w.markCh:
 			if mark.waiter != nil {
@@ -225,6 +292,43 @@ func (w *WaterMark) process(closer *z.Closer) {
 					processOne(index, mark.done)
 				}
 			}
+		}
+	}
+}
+
+// drainAndWakeup processes any marks already buffered in markCh (so indices
+// that completed right before shutdown can still advance doneUntil) and then
+// wakes up every blocked waiter. No waiter must outlive the processing
+// goroutine: otherwise its channel would never be closed and the goroutine
+// blocked in WaitForMark would leak.
+func (w *WaterMark) drainAndWakeup(
+	processOne func(index uint64, done bool),
+	waiters map[uint64][]chan struct{},
+) {
+	for {
+		select {
+		case mark := <-w.markCh:
+			if mark.waiter != nil {
+				if w.doneUntil.Load() >= mark.index {
+					close(mark.waiter)
+				} else {
+					waiters[mark.index] = append(waiters[mark.index], mark.waiter)
+				}
+			} else {
+				if mark.index > 0 || (mark.index == 0 && len(mark.indices) == 0) {
+					processOne(mark.index, mark.done)
+				}
+				for _, index := range mark.indices {
+					processOne(index, mark.done)
+				}
+			}
+		default:
+			for _, toNotify := range waiters {
+				for _, ch := range toNotify {
+					close(ch)
+				}
+			}
+			return
 		}
 	}
 }
