@@ -43,16 +43,11 @@ func (db *DB) Backup(w io.Writer, since uint64) (uint64, error) {
 	return stream.Backup(w, since)
 }
 
-// Backup dumps a protobuf-encoded list of all entries in the database into the
-// given writer, that are newer than or equal to the specified version. It returns a
-// timestamp(version) indicating the version of last entry that was dumped, which
-// after incrementing by 1 can be passed into a later invocation to generate an
-// incremental dump of entries that have been added/modified since the last
-// invocation of Stream.Backup().
-//
-// This can be used to backup the data in a database at a given point in time.
-func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
-	stream.KeyToList = func(key []byte, itr *Iterator) (*pb.KVList, error) {
+// backupKeyToListFunc returns the KeyToList function used to convert the
+// database contents into KVLists for a backup. It is shared by the legacy
+// (Stream.Backup) and manifest-based (Stream.BackupWithManifest) formats.
+func backupKeyToListFunc(stream *Stream, since uint64) func(key []byte, itr *Iterator) (*pb.KVList, error) {
+	return func(key []byte, itr *Iterator) (*pb.KVList, error) {
 		list := &pb.KVList{}
 		a := itr.Alloc
 		for ; itr.Valid(); itr.Next() {
@@ -109,6 +104,22 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 		}
 		return list, nil
 	}
+}
+
+// Backup dumps a protobuf-encoded list of all entries in the database into the
+// given writer, that are newer than or equal to the specified version. It returns a
+// timestamp(version) indicating the version of last entry that was dumped, which
+// after incrementing by 1 can be passed into a later invocation to generate an
+// incremental dump of entries that have been added/modified since the last
+// invocation of Stream.Backup().
+//
+// This can be used to backup the data in a database at a given point in time.
+//
+// The output uses the legacy framing (a sequence of length-prefixed KVList
+// records) and carries no manifest. Use Stream.BackupWithManifest to produce
+// backups that are validated end-to-end by Restore.
+func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
+	stream.KeyToList = backupKeyToListFunc(stream, since)
 
 	var maxVersion uint64
 	stream.Send = func(buf *z.Buffer) error {

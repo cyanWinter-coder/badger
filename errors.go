@@ -46,6 +46,19 @@ var (
 	// ErrBannedKey is returned if the read/write key belongs to any banned namespace.
 	ErrBannedKey = stderrors.New("Key is using the banned prefix")
 
+	// ErrBackupVersion is returned when a backup's format version is newer
+	// than what this build can restore.
+	ErrBackupVersion = stderrors.New("Unsupported backup format version")
+
+	// ErrBackupFeature is returned when a backup declares a required feature
+	// that this build does not understand.
+	ErrBackupFeature = stderrors.New("Backup requires an unknown required feature")
+
+	// ErrBackupCorrupt is returned when a backup fails validation: it is
+	// truncated, a shard does not match the manifest, or the manifest itself
+	// is malformed.
+	ErrBackupCorrupt = stderrors.New("Backup is corrupt or truncated")
+
 	// ErrThresholdZero is returned if threshold is set to zero, and value log GC is called.
 	// In such a case, GC can't be run.
 	ErrThresholdZero = stderrors.New(

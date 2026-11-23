@@ -27,9 +27,11 @@ var backupCmd = &cobra.Command{
 	Long: `Backup Badger database to a file in a version-agnostic manner.
 
 Iterates over each key-value pair, encodes it along with its metadata and
-version in protocol buffers and writes them to a file. This file can later be
-used by the restore command to create an identical copy of the
-database.`,
+version in protocol buffers and writes them to a file. The file carries a
+manifest describing the format version and every data shard (with checksums),
+so the restore command can validate the backup end-to-end before making it
+visible. This file can later be used by the restore command to create an
+identical copy of the database.`,
 	RunE: doBackup,
 }
 
@@ -64,7 +66,7 @@ func doBackup(cmd *cobra.Command, args []string) error {
 	}
 
 	bw := bufio.NewWriterSize(f, 64<<20)
-	if _, err = db.Backup(bw, 0); err != nil {
+	if _, err = db.BackupWithManifest(bw, 0); err != nil {
 		return err
 	}
 
