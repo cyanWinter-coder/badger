@@ -28,7 +28,7 @@ func TestTableIndex(t *testing.T) {
 	key := make([]byte, 32)
 	_, err := rand.Read(key)
 	require.NoError(t, err)
-	cache, err := ristretto.NewCache[uint64, *fb.TableIndex](&ristretto.Config[uint64, *fb.TableIndex]{
+	cache, err := ristretto.NewCache[[]byte, *fb.TableIndex](&ristretto.Config[[]byte, *fb.TableIndex]{
 		NumCounters: 1000,
 		MaxCost:     1 << 20,
 		BufferItems: 64,
@@ -145,7 +145,7 @@ func TestInvalidCompression(t *testing.T) {
 
 	t.Run("with correct decompression algo", func(t *testing.T) {
 		mf := openMmap()
-		table, err := OpenTable(mf, opts)
+		table, err := OpenTable(mf, opts, 0)
 		require.NoError(t, err)
 		require.NoError(t, table.Close(-1))
 	})
@@ -153,7 +153,7 @@ func TestInvalidCompression(t *testing.T) {
 		// Set incorrect compression algorithm.
 		opts.Compression = options.Snappy
 		mf := openMmap()
-		_, err := OpenTable(mf, opts)
+		_, err := OpenTable(mf, opts, 0)
 		require.Error(t, err)
 	})
 }
@@ -200,7 +200,7 @@ func BenchmarkBuilder(b *testing.B) {
 	})
 	b.Run("encryption", func(b *testing.B) {
 		var opt Options
-		cache, err := ristretto.NewCache(&ristretto.Config[uint64, *fb.TableIndex]{
+		cache, err := ristretto.NewCache(&ristretto.Config[[]byte, *fb.TableIndex]{
 			NumCounters: 1000,
 			MaxCost:     1 << 20,
 			BufferItems: 64,

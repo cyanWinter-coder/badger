@@ -194,7 +194,7 @@ func genTables(boundaries [][]byte) []*table.Table {
 		// Add one key so that we can open this table.
 		b.Add(y.KeyWithTs(k1, 1), y.ValueStruct{}, 0)
 		b.Add(y.KeyWithTs(k2, 1), y.ValueStruct{}, 0)
-		tab, err := table.OpenInMemoryTable(b.Finish(), 0, &opts)
+		tab, err := table.OpenInMemoryTable(b.Finish(), 0, &opts, 0)
 		y.Check(err)
 		return tab
 	}

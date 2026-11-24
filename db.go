@@ -132,7 +132,12 @@ type DB struct {
 	pub        *publisher
 	registry   *KeyRegistry
 	blockCache *ristretto.Cache[[]byte, *table.Block]
-	indexCache *ristretto.Cache[uint64, *fb.TableIndex]
+	indexCache *ristretto.Cache[[]byte, *fb.TableIndex]
+	// tableCache owns the lifetime of every open table handle: it dedupes opens,
+	// bounds the number of retained handles via LRU eviction, and guarantees a
+	// handle referenced by a reader or an iterator is never closed out from
+	// under it.
+	tableCache *table.TableCache
 	allocPool  *z.AllocatorPool
 }
 
@@ -306,7 +311,7 @@ func Open(opt Options) (*DB, error) {
 			numInCache = 1
 		}
 
-		config := ristretto.Config[uint64, *fb.TableIndex]{
+		config := ristretto.Config[[]byte, *fb.TableIndex]{
 			NumCounters: numInCache * 8,
 			MaxCost:     opt.IndexCacheSize,
 			BufferItems: 64,
@@ -337,6 +342,10 @@ func Open(opt Options) (*DB, error) {
 	if db.registry, err = OpenKeyRegistry(krOpt); err != nil {
 		return db, err
 	}
+	// The table cache must exist before levelsController loads tables, because
+	// every open table handle is registered with it and its generation drives
+	// the block/index cache keys.
+	db.initTableCache()
 	db.calculateSize()
 	db.closers.updateSize = z.NewCloser(1)
 	go db.updateSize(db.closers.updateSize)
@@ -495,6 +504,12 @@ func (db *DB) cleanup() {
 	db.stopMemoryFlush()
 	db.stopCompactions()
 
+	// Release any table handles opened before the failure. Close wakes waiters
+	// and closes idle handles; handles still referenced are finalized by their
+	// last DecrRef (e.g. closeAllTables during a failed level load).
+	if db.tableCache != nil {
+		_ = db.tableCache.Close()
+	}
 	db.blockCache.Close()
 	db.indexCache.Close()
 	if db.closers.updateSize != nil {
@@ -650,6 +665,14 @@ func (db *DB) close() (err error) {
 	db.opt.Infof(db.LevelsToString())
 	if lcErr := db.lc.close(); err == nil {
 		err = y.Wrap(lcErr, "DB.Close")
+	}
+	// All level-handler references are now dropped. Close the table cache: it
+	// wakes any goroutine still waiting on an open and releases every handle not
+	// pinned by a live reader (those are released by their final DecrRef).
+	if db.tableCache != nil {
+		if cacheErr := db.tableCache.Close(); cacheErr != nil && err == nil {
+			err = y.Wrap(cacheErr, "DB.Close")
+		}
 	}
 	db.opt.Debugf("Waiting for closer")
 	db.closers.updateSize.SignalAndWait()
@@ -1131,11 +1154,18 @@ func (db *DB) handleMemTableFlush(mt *memTable, dropPrefixes [][]byte) error {
 	fileID := db.lc.reserveFileID()
 	var tbl *table.Table
 	var err error
+	// Reserve the incarnation before building so the new SST file, its handle
+	// and all block/index cache keys carry the same generation.
+	gen := db.tableCache.NextGen()
+	bopts = bopts.WithGen(gen)
 	if db.opt.InMemory {
 		data := builder.Finish()
-		tbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
+		tbl, err = db.openInMemoryTable(data, fileID, gen, &bopts)
 	} else {
 		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder)
+		if err == nil {
+			err = db.registerCreatedTable(tbl)
+		}
 	}
 	if err != nil {
 		return y.Wrap(err, "error while creating table")

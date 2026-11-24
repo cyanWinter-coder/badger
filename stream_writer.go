@@ -479,17 +479,25 @@ func (w *sortedWriter) createTable(builder *table.Builder) error {
 	}
 
 	fileID := w.db.lc.reserveFileID()
+	// Reserve the incarnation before writing so the SST file, its handle and
+	// its block/index cache keys all carry the same generation.
+	gen := w.db.tableCache.NextGen()
 	var tbl *table.Table
 	if w.db.opt.InMemory {
 		data := builder.Finish()
 		var err error
-		if tbl, err = table.OpenInMemoryTable(data, fileID, builder.Opts()); err != nil {
+		if tbl, err = w.db.openInMemoryTable(data, fileID, gen, builder.Opts()); err != nil {
 			return err
 		}
 	} else {
+		opts := builder.Opts().WithGen(gen)
 		var err error
 		fname := table.NewFilename(fileID, w.db.opt.Dir)
-		if tbl, err = table.CreateTable(fname, builder); err != nil {
+		if tbl, err = table.CreateTableWithOpts(fname, builder, opts); err != nil {
+			return err
+		}
+		if err := w.db.registerCreatedTable(tbl); err != nil {
+			_ = tbl.DecrRef()
 			return err
 		}
 	}
@@ -505,6 +513,13 @@ func (w *sortedWriter) createTable(builder *table.Builder) error {
 		Compression: uint32(tbl.CompressionType()),
 	}
 	if err := w.db.manifest.addChanges([]*pb.ManifestChange{change}, w.db.opt); err != nil {
+		// Manifest rejected the table: remove its incarnation from the table cache
+		// and delete the backing file rather than leaking an unreachable handle.
+		// We still hold the creation-time reference here.
+		if w.db.tableCache != nil {
+			w.db.tableCache.MarkDeleted(tbl.ID())
+		}
+		_ = tbl.DecrRef()
 		return err
 	}
 

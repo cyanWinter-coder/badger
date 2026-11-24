@@ -105,7 +105,25 @@ func (s *levelHandler) deleteTables(toDel []*table.Table) error {
 
 	s.Unlock() // Unlock s _before_ we DecrRef our tables, which can be slow.
 
+	// Tombstone the backing files in the table cache before dropping the level
+	// handler's references. MarkDeleted only detaches the cache entry; the file
+	// is actually removed once every in-flight reader/iterator releases its ref,
+	// so concurrent reads keep working through their existing handles.
+	s.markDeleted(toDel)
 	return decrRefs(toDel)
+}
+
+// markDeleted tells the table cache the files backing these tables must be
+// deleted when their references drain. It is a no-op when no cache is wired
+// (standalone table usage), in which case DecrRef retains its legacy
+// delete-on-zero behavior.
+func (s *levelHandler) markDeleted(tables []*table.Table) {
+	if s.db == nil || s.db.tableCache == nil {
+		return
+	}
+	for _, t := range tables {
+		s.db.tableCache.MarkDeleted(t.ID())
+	}
 }
 
 // replaceTables will replace tables[left:right] with newTables. Note this EXCLUDES tables[right].
@@ -143,6 +161,9 @@ func (s *levelHandler) replaceTables(toDel, toAdd []*table.Table) error {
 		return y.CompareKeys(s.tables[i].Smallest(), s.tables[j].Smallest()) < 0
 	})
 	s.Unlock() // s.Unlock before we DecrRef tables -- that can be slow.
+	// The replaced tables are leaving the tree: their files must be deleted once
+	// in-flight readers drain, not while a reader may still be using the handle.
+	s.markDeleted(toDel)
 	return decrRefs(toDel)
 }
 
@@ -258,9 +279,22 @@ func (s *levelHandler) numTables() int {
 
 func (s *levelHandler) close() error {
 	s.RLock()
-	defer s.RUnlock()
+	tables := make([]*table.Table, len(s.tables))
+	copy(tables, s.tables)
+	s.RUnlock()
+
+	// Drop the level handler's references. Cache-managed tables are not closed
+	// here: the table cache owns the handles and releases them when it is closed
+	// (idle handles) or when the last reader finishes. Tables without a cache
+	// retain the historical Close behavior used by open-error cleanup.
 	var err error
-	for _, t := range s.tables {
+	if s.db != nil && s.db.tableCache != nil {
+		if decrErr := decrRefs(tables); decrErr != nil && err == nil {
+			err = decrErr
+		}
+		return y.Wrap(err, "levelHandler.close")
+	}
+	for _, t := range tables {
 		if closeErr := t.Close(-1); closeErr != nil && err == nil {
 			err = closeErr
 		}

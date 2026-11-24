@@ -67,6 +67,14 @@ type Options struct {
 	BlockCacheSize     int64
 	IndexCacheSize     int64
 
+	// NumOpenTables is the maximum number of SSTable file handles the table
+	// cache keeps open (retained, not merely referenced) at once. Handles in use
+	// by active reads or iterators are never closed; when the limit is exceeded
+	// the least recently used idle handles are evicted and re-opened on demand.
+	// A value <= 0 disables the limit (all handles are retained until the DB
+	// closes or the table is compacted away).
+	NumOpenTables int
+
 	NumLevelZeroTables      int
 	NumLevelZeroTablesStall int
 
@@ -147,6 +155,10 @@ func DefaultOptions(path string) Options {
 		Compression:             options.Snappy,
 		BlockCacheSize:          256 << 20,
 		IndexCacheSize:          0,
+
+		// Keep table handles open by default; the table cache still owns handle
+		// lifetimes and generations even when the open-handle limit is disabled.
+		NumOpenTables: 0,
 
 		// The following benchmarks were done on a 4 KB block size (default block size). The
 		// compression is ratio supposed to increase with increasing compression level but since the
@@ -745,6 +757,20 @@ func (opt Options) WithBypassLockGuard(b bool) Options {
 // memory.
 func (opt Options) WithIndexCacheSize(size int64) Options {
 	opt.IndexCacheSize = size
+	return opt
+}
+
+// WithNumOpenTables returns a new Options value with NumOpenTables set to the
+// given value.
+//
+// NumOpenTables bounds how many open SSTable handles the table cache retains.
+// Handles still referenced by active reads or iterators are never closed; once
+// the bound is exceeded, idle handles are evicted LRU-style and transparently
+// re-opened on the next access (under a new generation, so stale block/index
+// cache entries are never reused). A value <= 0 leaves the number of open
+// handles unbounded, which is the default.
+func (opt Options) WithNumOpenTables(n int) Options {
+	opt.NumOpenTables = n
 	return opt
 }
 

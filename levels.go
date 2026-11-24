@@ -111,7 +111,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 		default:
 		}
 		if err := throttle.Do(); err != nil {
-			closeAllTables(tables)
+			closeAllTables(db, tables)
 			return nil, err
 		}
 		if fileID > maxFileID {
@@ -135,27 +135,19 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 					fname, tf.Level, len(tables))
 				return
 			}
-			dk, err := db.registry.DataKey(tf.KeyID)
-			if err != nil {
-				rerr = y.Wrapf(err, "Error while reading datakey")
-				return
-			}
-			topt := buildTableOptions(db)
-			// Explicitly set Compression and DataKey based on how the table was generated.
-			topt.Compression = tf.Compression
-			topt.DataKey = dk
 
-			mf, err := z.OpenMmapFile(fname, db.opt.getFileFlags(), 0)
+			// Open through the table cache so the handle gets a generation, is
+			// deduplicated with concurrent opens and is owned for its whole
+			// lifetime by the cache. Acquire returns one reference, which becomes
+			// the level handler's hold when the table is installed below.
+			t, err := db.tableCache.Acquire(fileID)
 			if err != nil {
-				rerr = y.Wrapf(err, "Opening file: %q", fname)
-				return
-			}
-			t, err := table.OpenTable(mf, topt)
-			if err != nil {
-				if strings.HasPrefix(err.Error(), "CHECKSUM_MISMATCH:") {
+				if isChecksumOpenErr(err) {
 					db.opt.Errorf(err.Error())
-					db.opt.Errorf("Ignoring table %s", mf.Fd.Name())
-					// Do not set rerr. We will continue without this table.
+					db.opt.Errorf("Ignoring table %s", fname)
+					// Do not set rerr. We will continue without this table. The
+					// failed open never populated the cache, so no stale entry
+					// can poison later lookups.
 				} else {
 					rerr = y.Wrapf(err, "Opening table: %q", fname)
 				}
@@ -170,7 +162,7 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 		}(fname, tf)
 	}
 	if err := throttle.Finish(); err != nil {
-		closeAllTables(tables)
+		closeAllTables(db, tables)
 		return nil, err
 	}
 	db.opt.Infof("All %d tables opened in %s\n", numOpened.Load(),
@@ -199,10 +191,18 @@ func newLevelsController(db *DB, mf *Manifest) (*levelsController, error) {
 // Closes the tables, for cleanup in newLevelsController.  (We Close() instead of using DecrRef()
 // because that would delete the underlying files.)  We ignore errors, which is OK because tables
 // are read-only.
-func closeAllTables(tables [][]*table.Table) {
+// closeAllTables releases tables during a failed level load. Cache-managed
+// tables drop their single load-time reference so the table cache owns the
+// final close/delete (db.cleanup closes the cache afterwards); tables opened
+// without a cache keep the historical direct Close, which never deletes files.
+func closeAllTables(db *DB, tables [][]*table.Table) {
 	for _, tableSlice := range tables {
-		for _, table := range tableSlice {
-			_ = table.Close(-1)
+		for _, tbl := range tableSlice {
+			if db != nil && db.tableCache != nil {
+				_ = tbl.DecrRef()
+				continue
+			}
+			_ = tbl.Close(-1)
 		}
 	}
 }
@@ -251,6 +251,13 @@ func (s *levelsController) dropTree() (int, error) {
 		l.totalSize = 0
 		l.tables = l.tables[:0]
 		l.Unlock()
+	}
+	// Tombstone first so the cache deletes the files rather than merely closing
+	// them once the level-handler references below are released.
+	for _, t := range all {
+		if s.kv.tableCache != nil {
+			s.kv.tableCache.MarkDeleted(t.ID())
+		}
 	}
 	for _, table := range all {
 		if err := table.DecrRef(); err != nil {
@@ -889,6 +896,10 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		bopts := buildTableOptions(s.kv)
 		// Set TableSize to the target file size for that level.
 		bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
+		// Allocate the incarnation up front so the on-disk file and its
+		// block/index cache keys share the same generation once registered.
+		fileID := s.reserveFileID()
+		bopts = bopts.WithGen(s.kv.tableCache.NextGen())
 		builder := table.NewTableBuilder(bopts)
 
 		// This would do the iteration and add keys to builder.
@@ -914,7 +925,9 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 			var tbl *table.Table
 			if s.kv.opt.InMemory {
-				tbl, err = table.OpenInMemoryTable(builder.Finish(), fileID, &bopts)
+				// The generation was reserved above; reuse it for the in-memory
+				// incarnation so its identity is stable.
+				tbl, err = table.OpenInMemoryTable(builder.Finish(), fileID, &bopts, bopts.Gen())
 			} else {
 				fname := table.NewFilename(fileID, s.kv.opt.Dir)
 				tbl, err = table.CreateTable(fname, builder)
@@ -924,8 +937,12 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			if err != nil {
 				return
 			}
+			if err = s.kv.registerCreatedTable(tbl); err != nil {
+				_ = tbl.DecrRef()
+				return
+			}
 			res <- tbl
-		}(builder, s.reserveFileID())
+		}(builder, fileID)
 	}
 	s.kv.vlog.updateDiscardStats(discardStats)
 	s.kv.opt.Debugf("Discard stats: %v", discardStats)
@@ -1526,6 +1543,17 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 
 	// We write to the manifest _before_ we delete files (and after we created files)
 	if err := s.kv.manifest.addChanges(changeSet.Changes, s.kv.opt); err != nil {
+		// The manifest rejected the new tables, so they must never become
+		// visible. They were registered in the table cache on creation; tombstone
+		// them here so the deferred decr() below removes their files and cache
+		// entries instead of leaving idle, unreachable handles behind. The old
+		// tables are untouched and stay readable because their level handlers and
+		// references have not changed.
+		for _, t := range newTables {
+			if s.kv.tableCache != nil {
+				s.kv.tableCache.MarkDeleted(t.ID())
+			}
+		}
 		return err
 	}
 
@@ -1665,6 +1693,13 @@ func (s *levelsController) addLevel0Table(t *table.Table) error {
 			newCreateChange(t.ID(), 0, t.KeyID(), t.CompressionType()),
 		}, s.kv.opt)
 		if err != nil {
+			// The table never made it into the manifest. Evict its incarnation from
+			// the table cache so it cannot be served, and mark it for deletion. The
+			// caller (flush) still holds its reference and will release it, which
+			// finalizes the file removal. Existing tables are unaffected.
+			if s.kv.tableCache != nil {
+				s.kv.tableCache.MarkDeleted(t.ID())
+			}
 			return err
 		}
 	}
@@ -1858,6 +1893,7 @@ func (s *levelsController) getLevelInfo() []LevelInfo {
 
 // verifyChecksum verifies checksum for all tables on all levels.
 func (s *levelsController) verifyChecksum() error {
+	var firstErr error
 	var tables []*table.Table
 	for _, l := range s.levels {
 		l.RLock()
@@ -1870,18 +1906,30 @@ func (s *levelsController) verifyChecksum() error {
 
 		for _, t := range tables {
 			errChkVerify := t.VerifyChecksum()
-			if err := t.DecrRef(); err != nil {
+			if errChkVerify != nil && firstErr == nil {
+				firstErr = errChkVerify
+			}
+			if decrErr := t.DecrRef(); decrErr != nil {
 				s.kv.opt.Errorf("unable to decrease reference of table: %s while "+
-					"verifying checksum with error: %s", t.Filename(), err)
+					"verifying checksum with error: %s", t.Filename(), decrErr)
 			}
 
 			if errChkVerify != nil {
-				return errChkVerify
+				// A corrupt table only invalidates its own cache entry: every other
+				// shard and any iterator on a healthy table keeps working. The next
+				// read of this fid re-opens the file under a fresh generation (which
+				// fails again if the bytes on disk are still corrupt, but never
+				// returns a poisoned cached handle).
+				s.kv.opt.Errorf("checksum verification failed for table %s: %v; "+
+					"evicting its table cache entry", t.Filename(), errChkVerify)
+				if s.kv.tableCache != nil {
+					s.kv.tableCache.Invalidate(t.ID())
+				}
 			}
 		}
 	}
 
-	return nil
+	return firstErr
 }
 
 // Returns the sorted list of splits for all the levels and tables based

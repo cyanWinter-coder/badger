@@ -67,13 +67,30 @@ type Options struct {
 
 	// Block cache is used to cache decompressed and decrypted blocks.
 	BlockCache *ristretto.Cache[[]byte, *Block]
-	IndexCache *ristretto.Cache[uint64, *fb.TableIndex]
+	IndexCache *ristretto.Cache[[]byte, *fb.TableIndex]
 
 	AllocPool *z.AllocatorPool
 
 	// ZSTDCompressionLevel is the ZSTD compression level used for compressing blocks.
 	ZSTDCompressionLevel int
+
+	// gen is the generation assigned by the owning TableCache for a table being
+	// created through CreateTable. It is an internal plumbing field; callers
+	// normally open existing files through the cache, which passes the
+	// generation explicitly to OpenTable. Zero means "no cache / default
+	// incarnation" and is used by standalone table-package tests.
+	gen uint64
 }
+
+// WithGen returns a copy of opts carrying the given table-cache generation. It
+// is used by the flush/stream-writer paths before CreateTable.
+func (o Options) WithGen(gen uint64) Options {
+	o.gen = gen
+	return o
+}
+
+// Gen reports the generation plumbed into these options.
+func (o Options) Gen() uint64 { return o.gen }
 
 // TableInterface is useful for testing.
 type TableInterface interface {
@@ -94,9 +111,28 @@ type Table struct {
 	_cheap *cheapIndex
 	ref    atomic.Int32 // For file garbage collection
 
+	// releaseHook, when set, owns the table once its ref count reaches zero.
+	// It is installed by the TableCache on every handle it manages and decides
+	// whether the file is merely closed (eviction/DB close) or deleted
+	// (compaction removal). Tables used outside a cache (e.g. standalone table
+	// package tests) leave it nil and keep the historical delete-on-zero
+	// behavior.
+	releaseHook func(*Table) error
+	// deleteOnRelease marks a cache-managed table whose backing file must be
+	// removed when its final reference is dropped.
+	deleteOnRelease atomic.Bool
+
 	// The following are initialized once and const.
 	smallest, biggest []byte // Smallest and largest keys (with timestamps).
 	id                uint64 // file id, part of filename
+
+	// gen is the generation of this table instance. The same file id can be
+	// opened multiple times over the lifetime of a DB (e.g. an idle handle gets
+	// evicted from the table cache and the file is later re-opened, or a
+	// replacement table reuses a path). Every open assigns a fresh, monotonically
+	// increasing generation, so a handle can never be confused with a previous
+	// incarnation of the same file. It is part of every block/index cache key.
+	gen uint64
 
 	Checksum       []byte
 	CreatedAt      time.Time
@@ -148,22 +184,74 @@ func (t *Table) IncrRef() {
 	t.ref.Add(1)
 }
 
-// DecrRef decrements the refcount and possibly deletes the table
+// attachCache wires the table to its owning cache. Called once by
+// TableCache.Register/Acquire.
+func (t *Table) attachCache(tc *TableCache) {
+	t.releaseHook = tc.releaseEntry
+}
+
+func (t *Table) markDeleted() { t.deleteOnRelease.Store(true) }
+func (t *Table) isDeleted() bool {
+	return t.deleteOnRelease.Load()
+}
+
+// releaseCachedBlocks removes every block of this table from the block cache.
+// It must run before the file is closed/munmapped so cached blocks never point
+// into released memory.
+func (t *Table) releaseCachedBlocks() {
+	if t.opt.BlockCache == nil {
+		return
+	}
+	for i := 0; i < t.offsetsLength(); i++ {
+		t.opt.BlockCache.Del(t.blockCacheKey(i))
+	}
+}
+
+// releaseCachedIndex drops any cached, decrypted copy of this table's index.
+func (t *Table) releaseCachedIndex() {
+	if t.opt.IndexCache != nil {
+		t.opt.IndexCache.Del(t.indexKey())
+	}
+}
+
+// closeAndRelease frees the in-memory index state and closes the underlying
+// mmap/file WITHOUT deleting the file. It is the eviction/close counterpart of
+// Delete. Safe to call on an in-memory table (no fd): that is a no-op.
+func (t *Table) closeAndRelease() error {
+	t.releaseCachedBlocks()
+	t.releaseCachedIndex()
+	t._index = nil
+	t._cheap = nil
+	if t.IsInmemory {
+		return nil
+	}
+	return t.MmapFile.Close(-1)
+}
+
+// DecrRef decrements the refcount and possibly releases the table.
+//
+// For cache-managed tables the final DecrRef is routed through the cache,
+// which closes the file on eviction/DB shutdown or deletes it when the table
+// was tombstoned by a compaction. Active readers therefore always keep a valid
+// handle for the full duration of their reference, even if the cache evicted
+// the entry in the meantime. Tables without a cache retain the historical
+// behavior of deleting the file once the last reference goes away.
 func (t *Table) DecrRef() error {
 	newRef := t.ref.Add(-1)
-	if newRef == 0 {
-		// We can safely delete this file, because for all the current files, we always have
-		// at least one reference pointing to them.
-
-		// Delete all blocks from the cache.
-		for i := 0; i < t.offsetsLength(); i++ {
-			t.opt.BlockCache.Del(t.blockCacheKey(i))
-		}
-		if err := t.Delete(); err != nil {
-			return err
-		}
+	if newRef > 0 {
+		return nil
 	}
-	return nil
+	if newRef < 0 {
+		return fmt.Errorf("negative reference count for table %d", t.id)
+	}
+
+	if t.releaseHook != nil {
+		return t.releaseHook(t)
+	}
+
+	// Legacy path (no table cache): delete blocks and the file on final ref.
+	t.releaseCachedBlocks()
+	return t.Delete()
 }
 
 // BlockEvictHandler is used to reuse the byte slice stored in the block on cache eviction.
@@ -258,14 +346,46 @@ func CreateTable(fname string, builder *Builder) (*Table, error) {
 	if err := z.Msync(mf.Data); err != nil {
 		return nil, y.Wrapf(err, "while calling msync on %s", fname)
 	}
-	return OpenTable(mf, *builder.opts)
+	// A freshly created file gets its generation from the owning table cache;
+	// the flush/stream-writer path allocates one via TableCache.NextGen() and
+	// passes it in the builder options. Use 0 only as a defensive default for
+	// callers that build a table outside any cache (table package tests).
+	return OpenTable(mf, *builder.opts, builder.opts.gen)
+}
+
+// CreateTableWithOpts behaves like CreateTable but lets the caller override the
+// options used to open the freshly written file. This is used to plumb a
+// table-cache generation reserved before the build into the new handle without
+// mutating the builder.
+func CreateTableWithOpts(fname string, builder *Builder, opts Options) (*Table, error) {
+	bd := builder.Done()
+	mf, err := z.OpenMmapFile(fname, os.O_CREATE|os.O_RDWR|os.O_EXCL, bd.Size)
+	if err == z.NewFile {
+		// Expected.
+	} else if err != nil {
+		return nil, y.Wrapf(err, "while creating table: %s", fname)
+	} else {
+		return nil, fmt.Errorf("file already exists: %s", fname)
+	}
+
+	written := bd.Copy(mf.Data)
+	y.AssertTrue(written == len(mf.Data))
+	if err := z.Msync(mf.Data); err != nil {
+		return nil, y.Wrapf(err, "while calling msync on %s", fname)
+	}
+	return OpenTable(mf, opts, opts.gen)
 }
 
 // OpenTable assumes file has only one table and opens it. Takes ownership of fd upon function
 // entry. Returns a table with one reference count on it (decrementing which may delete the file!
 // -- consider t.Close() instead). The fd has to writeable because we call Truncate on it before
 // deleting. Checksum for all blocks of table is verified based on value of chkMode.
-func OpenTable(mf *z.MmapFile, opts Options) (*Table, error) {
+//
+// gen is the generation assigned by the table cache for this particular open of
+// the file. Two opens of the same file id always get different generations, so
+// block/index cache entries left behind by a previous incarnation can never be
+// mistaken for the current one.
+func OpenTable(mf *z.MmapFile, opts Options, gen uint64) (*Table, error) {
 	// BlockSize is used to compute the approximate size of the decompressed
 	// block. It should not be zero if the table is compressed.
 	if opts.BlockSize == 0 && opts.Compression != options.None {
@@ -287,6 +407,7 @@ func OpenTable(mf *z.MmapFile, opts Options) (*Table, error) {
 	t := &Table{
 		MmapFile:   mf,
 		id:         id,
+		gen:        gen,
 		opt:        &opts,
 		IsInmemory: false,
 		tableSize:  int(fileInfo.Size()),
@@ -311,8 +432,9 @@ func OpenTable(mf *z.MmapFile, opts Options) (*Table, error) {
 }
 
 // OpenInMemoryTable is similar to OpenTable but it opens a new table from the provided data.
-// OpenInMemoryTable is used for L0 tables.
-func OpenInMemoryTable(data []byte, id uint64, opt *Options) (*Table, error) {
+// OpenInMemoryTable is used for L0 tables. gen is the table-cache generation assigned to this
+// in-memory incarnation (see OpenTable).
+func OpenInMemoryTable(data []byte, id uint64, opt *Options, gen uint64) (*Table, error) {
 	mf := &z.MmapFile{
 		Data: data,
 		Fd:   nil,
@@ -323,6 +445,7 @@ func OpenInMemoryTable(data []byte, id uint64, opt *Options) (*Table, error) {
 		tableSize:  len(data),
 		IsInmemory: true,
 		id:         id, // It is important that each table gets a unique ID.
+		gen:        gen,
 	}
 	// Caller is given one reference.
 	t.ref.Store(1)
@@ -648,22 +771,31 @@ func (t *Table) block(idx int, useCache bool) (*Block, error) {
 	return blk, nil
 }
 
-// blockCacheKey is used to store blocks in the block cache.
+// blockCacheKey encodes (table id, generation, block index) into a fixed-width
+// ristretto key. Including the generation means blocks cached for an
+// evicted/closed incarnation of a table can never be served to a different
+// handle that happens to reuse the same file id, even if the on-disk file has
+// since been replaced.
+//
+// The layout is 8 bytes table id + 8 bytes generation + 4 bytes block index.
 func (t *Table) blockCacheKey(idx int) []byte {
-	y.AssertTrue(t.id < math.MaxUint32)
-	y.AssertTrue(uint32(idx) < math.MaxUint32)
+	y.AssertTrue(uint64(idx) < math.MaxUint32)
 
-	buf := make([]byte, 8)
-	// Assume t.ID does not overflow uint32.
-	binary.BigEndian.PutUint32(buf[:4], uint32(t.ID()))
-	binary.BigEndian.PutUint32(buf[4:], uint32(idx))
+	buf := make([]byte, 20)
+	binary.BigEndian.PutUint64(buf[0:8], t.id)
+	binary.BigEndian.PutUint64(buf[8:16], t.gen)
+	binary.BigEndian.PutUint32(buf[16:20], uint32(idx))
 	return buf
 }
 
-// indexKey returns the cache key for block offsets. blockOffsets
-// are stored in the index cache.
-func (t *Table) indexKey() uint64 {
-	return t.id
+// indexKey returns the cache key for block offsets. blockOffsets are stored in
+// the index cache. Like blockCacheKey it carries the generation so indices of
+// distinct incarnations of a file never alias.
+func (t *Table) indexKey() []byte {
+	buf := make([]byte, 16)
+	binary.BigEndian.PutUint64(buf[0:8], t.id)
+	binary.BigEndian.PutUint64(buf[8:16], t.gen)
+	return buf
 }
 
 // IndexSize is the size of table index in bytes.
@@ -693,6 +825,17 @@ func (t *Table) Filename() string {
 
 // ID is the table's ID number (used to make the file name).
 func (t *Table) ID() uint64 { return t.id }
+
+// Gen is the generation of this particular open of the table file. It is unique
+// across every incarnation of a given file id for the lifetime of the table
+// cache, and together with ID uniquely identifies a table handle.
+func (t *Table) Gen() uint64 { return t.gen }
+
+// SetGen assigns the table-cache generation to a freshly built table. It is
+// intended for tables created via CreateTable/OpenInMemoryTable before they
+// are adopted by a cache; reassigning a generation on a registered table would
+// break cache-key uniqueness and is not supported.
+func (t *Table) SetGen(gen uint64) { t.gen = gen }
 
 // DoesNotHave returns true if and only if the table does not have the key hash.
 // It does a bloom filter lookup.
@@ -732,8 +875,10 @@ func (t *Table) VerifyChecksum() error {
 	for i := 0; i < ti.OffsetsLength(); i++ {
 		b, err := t.block(i, true)
 		if err != nil {
-			return y.Wrapf(err, "checksum validation failed for table: %s, block: %d, offset:%d",
-				t.Filename(), i, b.offset)
+			// b is nil on a read/decode failure, so do not dereference it while
+			// building the error; the block index already identifies the offset.
+			return y.Wrapf(err, "checksum validation failed for table: %s, block: %d",
+				t.Filename(), i)
 		}
 		// We should not call incrRef here, because the block already has one ref when created.
 		defer b.decrRef()

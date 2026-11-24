@@ -676,7 +676,7 @@ func TestTableChecksum(t *testing.T) {
 	// since randomly initializing bytes can kill the compression storage.
 	opts.Compression = options.None
 	tbl := buildTestTable(t, "k", 10000, opts)
-	defer func() { require.NoError(t, tbl.DecrRef()) }()
+
 	// Write random bytes at location guaranteed to not be in range of
 	// metadata for block. (No particular reason for the value 128,
 	// it just avoids the sensitive block size or other metadata blocks).
@@ -684,15 +684,19 @@ func TestTableChecksum(t *testing.T) {
 	n := copy(tbl.Data[start:], rb)
 	require.Equal(t, n, len(rb))
 
-	require.Panics(t, func() {
-		// Either OpenTable will panic on corrupted data or the checksum verification will fail.
-		_, err := OpenTable(tbl.MmapFile, opts)
-		if strings.Contains(err.Error(), "checksum") {
-			panic("checksum mismatch")
-		} else {
-			require.NoError(t, err)
-		}
-	})
+	// The original table stays owned by tbl (its own mmap/fd). Re-opening the
+	// corrupted file must use a *fresh* mmap, mirroring the real load path where
+	// every OpenTable gets its own fd rather than sharing another table's. A
+	// failed OpenTable closes only that fresh fd and must not touch tbl.
+	mf, err := z.OpenMmapFile(tbl.Filename(), os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = OpenTable(mf, opts, 0)
+	require.Error(t, err)
+	require.True(t, strings.Contains(err.Error(), "checksum"),
+		"expected a checksum error, got: %v", err)
+
+	// The original handle is unaffected by the failed re-open and closes cleanly.
+	require.NoError(t, tbl.DecrRef())
 }
 
 var cacheConfig = ristretto.Config[[]byte, *Block]{
@@ -907,7 +911,7 @@ func TestInMemoryTableBlockErrorNoPanic(t *testing.T) {
 	srcID := src.ID()
 	require.NoError(t, src.DecrRef())
 
-	tbl, err := OpenInMemoryTable(data, srcID, &opts)
+	tbl, err := OpenInMemoryTable(data, srcID, &opts, 0)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, tbl.DecrRef()) }()
 
