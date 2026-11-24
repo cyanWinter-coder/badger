@@ -61,7 +61,17 @@ func (p *publisher) listenForUpdates(c *z.Closer) {
 	for {
 		select {
 		case <-c.HasBeenClosed():
-			return
+			// Release the request references of any updates still queued in
+			// pubCh, so pending requests are returned to the pool instead of
+			// leaking their handles on the shutdown path.
+			for {
+				select {
+				case reqs := <-p.pubCh:
+					reqs.DecrRef()
+				default:
+					return
+				}
+			}
 		case reqs := <-p.pubCh:
 			slurp(reqs)
 		}

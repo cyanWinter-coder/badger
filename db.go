@@ -130,6 +130,7 @@ type DB struct {
 	threshold        *vlogThreshold
 
 	pub        *publisher
+	streamMgr  *streamSessionManager
 	registry   *KeyRegistry
 	blockCache *ristretto.Cache[[]byte, *table.Block]
 	indexCache *ristretto.Cache[uint64, *fb.TableIndex]
@@ -265,6 +266,7 @@ func Open(opt Options) (*DB, error) {
 
 	db.flushCond = sync.NewCond(&db.lock)
 	db.syncChan = opt.syncChan
+	db.streamMgr = newStreamSessionManager(db)
 
 	// Cleanup all the goroutines started by badger in case of an error.
 	defer func() {
@@ -583,6 +585,12 @@ func (db *DB) close() (err error) {
 
 	// Don't accept any more write.
 	close(db.writeCh)
+
+	// Stop the stream session manager before the publisher: it detaches all
+	// resumable sessions and releases the shared change-stream reader.
+	if db.streamMgr != nil {
+		db.streamMgr.close()
+	}
 
 	db.closers.pub.SignalAndWait()
 	db.closers.cacheHealth.Signal()

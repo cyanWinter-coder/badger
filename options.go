@@ -101,6 +101,12 @@ type Options struct {
 	// NamespaceOffset specifies the offset from where the next 8 bytes contains the namespace.
 	NamespaceOffset int
 
+	// StreamCursorStore persists the acknowledged cursors of resumable
+	// stream sessions (see DB.NewStreamSession). When nil, cursors are kept
+	// in memory and only survive for the lifetime of the DB object. Use
+	// NewFileStreamCursorStore to make session progress survive restarts.
+	StreamCursorStore StreamCursorStore
+
 	// Magic version used by the application using badger to ensure that it doesn't open the DB
 	// with incompatible data format.
 	ExternalMagicVersion uint16

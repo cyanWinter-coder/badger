@@ -114,4 +114,22 @@ var (
 
 	// ErrDBClosed is returned when a get operation is performed after closing the DB.
 	ErrDBClosed = stderrors.New("DB Closed")
+
+	// ErrStreamStaleAck is returned when a stream session ack arrives for a
+	// generation that is no longer the session's active generation (or for a
+	// session that is not attached at all). The ack has no effect.
+	ErrStreamStaleAck = stderrors.New("Stream ack belongs to a stale or unknown session generation")
+
+	// ErrStreamSessionActive is returned when opening a stream session whose
+	// ID still has an active generation attached.
+	ErrStreamSessionActive = stderrors.New("Stream session already has an active generation")
+
+	// ErrStreamSessionClosed is returned when serving a stream session that
+	// has already been closed.
+	ErrStreamSessionClosed = stderrors.New("Stream session is closed")
+
+	// ErrStreamCursorExpired is returned when a stream session's persisted
+	// cursor is older than the oldest retained change, meaning some
+	// unacknowledged records can no longer be replayed.
+	ErrStreamCursorExpired = stderrors.New("Stream cursor is older than the retained change log")
 )
