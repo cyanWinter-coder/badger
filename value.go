@@ -251,9 +251,15 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 			es += int64(len(e.Value))
 
 			// Ensure length and size of wb is within transaction limits.
+			//
+			// Nothing is written through the ordinary batch path: every
+			// relocated entry goes through batchSetGC so the single-threaded
+			// vlog writer feeds its landing pointer into the gcTracker. A
+			// plain batchSet here would bypass the tracker and corrupt the
+			// batch's recorded boundary.
 			if int64(len(wb)+1) >= vlog.opt.maxBatchCount ||
 				size+es >= vlog.opt.maxBatchSize {
-				if err := vlog.db.batchSet(wb); err != nil {
+				if err := vlog.db.batchSetGC(wb); err != nil {
 					return err
 				}
 				size = 0
@@ -316,6 +322,29 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 		return nil
 	}
 
+	// Phase 2 setup: install the tracker before any relocated entry is written
+	// so the single-threaded vlog writer can capture every landing pointer,
+	// including entries flushed mid-scan when wb fills up. The source file is
+	// untouched and discard stats are not advanced, so readers keep using the
+	// old values throughout the rewrite.
+	vlog.gcGeneration++
+	gen := vlog.gcGeneration
+	tracker := newGCWriteTracker()
+	vlog.gcTracker = tracker
+	// The tracker must never leak into later foreground writes. Every exit
+	// path below either detaches it explicitly or trips this cleanup.
+	defer func() {
+		if vlog.gcTracker == tracker {
+			vlog.gcTracker = nil
+		}
+	}()
+
+	if hook := vlog.db.vlogGCCrashHook; hook != nil {
+		if err := hook(gcPhaseBeforeWriteback, f.fid, nil); err != nil {
+			return err
+		}
+	}
+
 	_, err := f.iterate(vlog.opt.ReadOnly, 0, func(e Entry, vp valuePointer) error {
 		return fe(e)
 	})
@@ -324,11 +353,13 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 	}
 
 	// vlogGCPauseHook fires here in tests to inject a delete + compaction
-	// into the race window between Phase 1 (scan) and Phase 2 (write-back).
+	// into the race window between Phase 1 (scan) and the tail write-back.
 	if vlog.db.vlogGCPauseHook != nil {
 		vlog.db.vlogGCPauseHook()
 	}
 
+	// Flush the tail of the relocated entries. Large batches are split so an
+	// ErrTxnTooBig shrinks the next attempt instead of failing the whole batch.
 	batchSize := 1024
 	var loops int
 	for i := 0; i < len(wb); {
@@ -341,7 +372,7 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 		if end > len(wb) {
 			end = len(wb)
 		}
-		if err := vlog.db.batchSet(wb[i:end]); err != nil {
+		if err := vlog.db.batchSetGC(wb[i:end]); err != nil {
 			if err == ErrTxnTooBig {
 				// Decrease the batch size to half.
 				batchSize = batchSize / 2
@@ -353,9 +384,66 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 	}
 	vlog.opt.Infof("Processed %d entries in %d loops", len(wb), loops)
 	vlog.opt.Infof("Total entries: %d. Moved: %d", count, moved)
+	// Detach the tracker before anything else can write, freezing the boundary.
+	vlog.gcTracker = nil
+	bounds := tracker.snapshot()
+
+	if hook := vlog.db.vlogGCCrashHook; hook != nil {
+		if err := hook(gcPhaseAfterWriteback, f.fid, bounds); err != nil {
+			return err
+		}
+	}
+
+	// Phase 3: durability barrier. Nothing may be published as committed until
+	// every byte the move keys point at is on stable storage. When no entry
+	// landed in the vlog (all live values fit in the LSM), there is no target
+	// boundary to protect; retire the source directly below.
+	var cp *gcCheckpoint
+	if len(bounds) > 0 {
+		cp = &gcCheckpoint{
+			Generation: gen,
+			SourceFid:  f.fid,
+			State:      gcStatePrepared,
+			Targets:    bounds,
+		}
+		if err := vlog.gcDurabilityBarrier(cp); err != nil {
+			return err
+		}
+		if hook := vlog.db.vlogGCCrashHook; hook != nil {
+			if err := hook(gcPhaseAfterSync, f.fid, bounds); err != nil {
+				return err
+			}
+		}
+		// Re-verify the generational boundaries against the on-disk files. A
+		// target that was truncated or short of its recorded boundary means the
+		// values are not actually recoverable, so the batch must fail without
+		// retiring the source.
+		if err := vlog.verifyGCBounds(bounds); err != nil {
+			return y.Wrapf(err, "while verifying gc boundaries for fid %d", f.fid)
+		}
+
+		// Phase 4: persist a prepared record first, then publish the committed
+		// checkpoint atomically (rename + dir fsync). Prepared temp files are
+		// ignored and cleaned on restart if we die here.
+		if err := vlog.persistCheckpoint(cp); err != nil {
+			return err
+		}
+		cp.State = gcStateCommitted
+		if err := vlog.persistCheckpoint(cp); err != nil {
+			return y.Wrapf(err, "while publishing committed gc checkpoint for fid %d", f.fid)
+		}
+		if hook := vlog.db.vlogGCCrashHook; hook != nil {
+			if err := hook(gcPhaseAfterCheckpoint, f.fid, bounds); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Phase 5: the rewrite is now recoverable. Retire the source and its
+	// discard entry. Deleting from filesMap stops new readers; existing
+	// readers keep the file alive via their RLock until they finish.
 	vlog.opt.Infof("Removing fid: %d", f.fid)
 	var deleteFileNow bool
-	// Entries written to LSM. Remove the older file now.
 	{
 		vlog.filesLock.Lock()
 		// Just a sanity-check.
@@ -375,6 +463,114 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 	if deleteFileNow {
 		if err := vlog.deleteLogFile(f); err != nil {
 			return err
+		}
+		// Source fully retired; the commit record has served its purpose.
+		if err := vlog.removeCheckpoint(f.fid); err != nil {
+			return err
+		}
+	}
+	// When iterators are active, decrIteratorCount performs the file deletion
+	// and checkpoint removal instead. Either way the source's old values stay
+	// readable until the last reader releases the file.
+	return nil
+}
+
+// gcDurabilityBarrier fsyncs every target vlog touched by the batch together
+// with the current memtable WAL holding the move keys. Target files are synced
+// under a read lock only, so concurrent foreground reads are never blocked.
+func (vlog *valueLog) gcDurabilityBarrier(cp *gcCheckpoint) error {
+	vlog.filesLock.RLock()
+	for _, t := range cp.Targets {
+		lf, ok := vlog.filesMap[t.Fid]
+		if !ok {
+			vlog.filesLock.RUnlock()
+			return fmt.Errorf("gc target fid %d disappeared before sync", t.Fid)
+		}
+		lf.lock.RLock()
+		err := lf.Sync()
+		lf.lock.RUnlock()
+		if err != nil {
+			vlog.filesLock.RUnlock()
+			return y.Wrapf(err, "while syncing gc target fid %d", t.Fid)
+		}
+	}
+	vlog.filesLock.RUnlock()
+
+	// Move keys live in the active memtable's WAL (and, once flushed, in L0
+	// SSTs whose builder msyncs on finish). Without this sync, a crash after
+	// checkpoint publish could leave target values on disk but no LSM pointers
+	// referencing them. db.lock mirrors DB.Sync: a flush swaps db.mt under this
+	// lock, so holding the read lock pins the memtable for the duration.
+	vlog.db.lock.RLock()
+	mt := vlog.db.mt
+	vlog.db.lock.RUnlock()
+	if mt != nil && mt.wal != nil {
+		if err := mt.SyncWAL(); err != nil {
+			return y.Wrapf(err, "while syncing memtable WAL during gc commit")
+		}
+	}
+	return nil
+}
+
+// verifyGCBounds walks each target file and confirms it still spans the full,
+// intact byte range the batch recorded. This is the "verifiable generational
+// boundary":
+//   - the file is at least as long as the recorded end offset (a truncated
+//     target fails here instead of being accepted as a complete value log);
+//   - iterating [StartOff, EndOff) yields exactly TotalRecords entries with
+//     the last one ending precisely at EndOff.
+//
+// On the commit-time call the TotalRecords field is still zero and gets
+// populated from the walk (it includes any foreground entries interleaved
+// inside the batch's range). On restart the recorded value must match exactly.
+func (vlog *valueLog) verifyGCBounds(bounds []gcTargetBounds) error {
+	vlog.filesLock.RLock()
+	defer vlog.filesLock.RUnlock()
+	for i := range bounds {
+		b := &bounds[i]
+		lf, ok := vlog.filesMap[b.Fid]
+		if !ok {
+			return fmt.Errorf("gc target fid %d not found", b.Fid)
+		}
+		lf.lock.RLock()
+		actualSize := lf.size.Load()
+		lf.lock.RUnlock()
+		if actualSize < b.EndOff {
+			return fmt.Errorf("gc target fid %d truncated: size %d < boundary end %d",
+				b.Fid, actualSize, b.EndOff)
+		}
+		var total uint32
+		var lastEnd uint32
+		_, err := lf.iterate(vlog.opt.ReadOnly, b.StartOff, func(_ Entry, vp valuePointer) error {
+			if vp.Fid != b.Fid || vp.Offset < b.StartOff {
+				return errStop
+			}
+			if vp.Offset >= b.EndOff {
+				return errStop
+			}
+			total++
+			lastEnd = vp.Offset + vp.Len
+			return nil
+		})
+		if err != nil {
+			return y.Wrapf(err, "while iterating gc target fid %d", b.Fid)
+		}
+		if lastEnd != b.EndOff {
+			return fmt.Errorf("gc target fid %d boundary mismatch: last record ends at %d, want %d",
+				b.Fid, lastEnd, b.EndOff)
+		}
+		if total < b.Records {
+			return fmt.Errorf("gc target fid %d lost GC records: range has %d entries, requires %d",
+				b.Fid, total, b.Records)
+		}
+		if b.TotalRecords == 0 {
+			// Commit-time call: freeze the observed range count.
+			b.TotalRecords = total
+			continue
+		}
+		if total != b.TotalRecords {
+			return fmt.Errorf("gc target fid %d entry count changed: have %d, checkpoint requires %d",
+				b.Fid, total, b.TotalRecords)
 		}
 	}
 	return nil
@@ -396,6 +592,7 @@ func (vlog *valueLog) decrIteratorCount() error {
 
 	vlog.filesLock.Lock()
 	lfs := make([]*logFile, 0, len(vlog.filesToBeDeleted))
+	fids := append([]uint32(nil), vlog.filesToBeDeleted...)
 	for _, id := range vlog.filesToBeDeleted {
 		lfs = append(lfs, vlog.filesMap[id])
 		delete(vlog.filesMap, id)
@@ -403,8 +600,13 @@ func (vlog *valueLog) decrIteratorCount() error {
 	vlog.filesToBeDeleted = nil
 	vlog.filesLock.Unlock()
 
-	for _, lf := range lfs {
+	for i, lf := range lfs {
 		if err := vlog.deleteLogFile(lf); err != nil {
+			return err
+		}
+		// The GC batch that retired this file committed before the file was
+		// marked pending; its checkpoint can now be consumed.
+		if err := vlog.removeCheckpoint(fids[i]); err != nil {
 			return err
 		}
 	}
@@ -448,6 +650,18 @@ func (vlog *valueLog) dropAll() (int, error) {
 		return count, err
 	}
 
+	// GC checkpoints reference vlog files that no longer exist; remove them so
+	// recovery after a dropAll never tries to verify stale boundaries.
+	if fids, err := vlog.listGCCheckpointFids(); err != nil {
+		return count, err
+	} else {
+		for _, fid := range fids {
+			if err := vlog.removeCheckpoint(fid); err != nil {
+				return count, err
+			}
+		}
+	}
+
 	vlog.db.opt.Infof("Value logs deleted. Creating value log file: 1")
 	if _, err := vlog.createVlogFile(); err != nil { // Called while writes are stopped.
 		return count, err
@@ -477,6 +691,64 @@ type valueLog struct {
 
 	garbageCh    chan struct{}
 	discardStats *discardStats
+
+	// gcTracker, when non-nil, is fed the value pointers of every entry
+	// belonging to an in-flight GC rewrite as they land in the vlog. The write
+	// path is single-threaded (see doWrites) and rewrites are serialized by
+	// garbageCh, so no locking is needed.
+	gcTracker *gcWriteTracker
+	// gcGeneration is the batch id handed out to the next rewrite. It is only
+	// ever incremented in-process and only needs to be unique within the life
+	// of a DB: checkpoints are consumed (deleted) when their batch retires, so
+	// a restart always starts from a clean checkpoint set.
+	gcGeneration uint64
+}
+
+// gcWriteTracker records the on-disk bounds a GC rewrite batch occupies in
+// each target vlog file. Bounds are assembled into a generational boundary in
+// the batch's checkpoint and re-verified on commit and on restart.
+type gcWriteTracker struct {
+	bounds map[uint32]*gcTargetBounds
+}
+
+func newGCWriteTracker() *gcWriteTracker {
+	return &gcWriteTracker{bounds: make(map[uint32]*gcTargetBounds)}
+}
+
+// record absorbs one relocated entry's final value pointer.
+func (t *gcWriteTracker) record(vp valuePointer) {
+	if vp.Len == 0 {
+		// Entry was small enough to stay in the LSM; nothing hit the vlog.
+		return
+	}
+	b, ok := t.bounds[vp.Fid]
+	if !ok {
+		b = &gcTargetBounds{Fid: vp.Fid, StartOff: vp.Offset, EndOff: vp.Offset}
+		t.bounds[vp.Fid] = b
+	}
+	// Vlog writes are append-only and serialized: the latest pointer always
+	// extends the boundary for its file.
+	if vp.Offset < b.StartOff {
+		b.StartOff = vp.Offset
+	}
+	if end := vp.Offset + vp.Len; end > b.EndOff {
+		b.EndOff = end
+	}
+	b.Records++
+}
+
+// snapshot returns a deterministic, per-fid ordered copy of the bounds.
+func (t *gcWriteTracker) snapshot() []gcTargetBounds {
+	fids := make([]uint32, 0, len(t.bounds))
+	for fid := range t.bounds {
+		fids = append(fids, fid)
+	}
+	sort.Slice(fids, func(i, j int) bool { return fids[i] < fids[j] })
+	out := make([]gcTargetBounds, 0, len(fids))
+	for _, fid := range fids {
+		out = append(out, *t.bounds[fid])
+	}
+	return out
 }
 
 func vlogFilePath(dirPath string, fid uint32) string {
@@ -625,6 +897,15 @@ func (vlog *valueLog) open(db *DB) error {
 	if vlog.opt.ReadOnly {
 		return nil
 	}
+
+	// Reconcile GC batches that were interrupted by a crash before any vlog
+	// truncation happens. Uncommitted target fragments are discarded together
+	// with their temp checkpoints; committed batches finish retiring the source
+	// and hard-fail if a target no longer reaches its verified boundary.
+	if err := vlog.recoverGCBatches(); err != nil {
+		return y.Wrapf(err, "during gc checkpoint recovery")
+	}
+
 	// Now we can read the latest value log file, and see if it needs truncation. We could
 	// technically do this over all the value log files, but that would mean slowing down the value
 	// log open.
@@ -702,6 +983,10 @@ type request struct {
 	Wg   sync.WaitGroup
 	Err  error
 	ref  atomic.Int32
+	// gcRewrite marks a request carrying entries relocated by a vlog GC batch.
+	// The serialized write path reports their landing pointers to the active
+	// gcTracker so the batch's generational boundaries can be checkpointed.
+	gcRewrite bool
 }
 
 func (req *request) reset() {
@@ -709,6 +994,7 @@ func (req *request) reset() {
 	req.Ptrs = req.Ptrs[:0]
 	req.Wg = sync.WaitGroup{}
 	req.Err = nil
+	req.gcRewrite = false
 	req.ref.Store(0)
 }
 
@@ -928,6 +1214,14 @@ func (vlog *valueLog) write(reqs []*request) error {
 		if err := toDisk(); err != nil {
 			return err
 		}
+		// GC rewrite entries share the ordinary write path. Record where their
+		// values actually landed (possibly across rotated target files) so the
+		// rewrite can checkpoint and verify its generational boundaries.
+		if b.gcRewrite && vlog.gcTracker != nil {
+			for _, vp := range b.Ptrs {
+				vlog.gcTracker.record(vp)
+			}
+		}
 	}
 	return toDisk()
 }
@@ -1087,12 +1381,12 @@ func (vlog *valueLog) doRunGC(lf *logFile) error {
 	_, span := otel.Tracer("").Start(context.TODO(), "Badger.GC")
 	span.SetAttributes(attribute.String("GC rewrite for", lf.path))
 	defer span.End()
-	if err := vlog.rewrite(lf); err != nil {
-		return err
-	}
-	// Remove the file from discardStats.
-	vlog.discardStats.Update(lf.fid, -1)
-	return nil
+	// rewrite now performs an atomic, recoverable commit: discard stats are
+	// retired together with the source file only after the committed
+	// checkpoint is published (or via recoverGCBatches on restart). Clearing
+	// them here, before that point, would let a failed batch double-consume the
+	// same discard budget.
+	return vlog.rewrite(lf)
 }
 
 func (vlog *valueLog) waitOnGC(lc *z.Closer) {

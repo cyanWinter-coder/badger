@@ -46,6 +46,12 @@ type testOnlyDBExtensions struct {
 	// inject a delete + compaction into the race window to reproduce the
 	// GC write-back race deterministically.
 	vlogGCPauseHook func()
+
+	// vlogGCCrashHook is called at each ordering boundary of the recoverable
+	// GC commit protocol (see gcPhase* constants). Returning an error aborts
+	// the rewrite at that boundary so tests can reopen the DB and assert the
+	// recovery outcome. Nil in production.
+	vlogGCCrashHook func(phase int, sourceFid uint32, bounds []gcTargetBounds) error
 }
 
 // logToSyncChan sends a message to the DB's syncChan. Note that we expect

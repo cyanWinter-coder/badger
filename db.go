@@ -914,6 +914,13 @@ func (db *DB) writeRequests(reqs []*request) error {
 }
 
 func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
+	return db.sendToWriteChWithFlag(entries, false)
+}
+
+// sendToWriteChWithFlag is the internal variant of sendToWriteCh. A gcRewrite
+// request belongs to a vlog GC batch; its value pointers are fed to the active
+// gcTracker for checkpointing instead of being treated as user traffic.
+func (db *DB) sendToWriteChWithFlag(entries []*Entry, gcRewrite bool) (*request, error) {
 	if db.blockWrites.Load() == 1 {
 		return nil, ErrBlockedWrites
 	}
@@ -922,7 +929,9 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 		size += e.estimateSizeAndSetThreshold(db.valueThreshold())
 		count++
 	}
-	y.NumBytesWrittenUserAdd(db.opt.MetricsEnabled, size)
+	if !gcRewrite {
+		y.NumBytesWrittenUserAdd(db.opt.MetricsEnabled, size)
+	}
 	if count >= db.opt.maxBatchCount || size >= db.opt.maxBatchSize {
 		return nil, ErrTxnTooBig
 	}
@@ -932,10 +941,13 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.Entries = entries
+	req.gcRewrite = gcRewrite
 	req.Wg.Add(1)
 	req.IncrRef()     // for db write
 	db.writeCh <- req // Handled in doWrites.
-	y.NumPutsAdd(db.opt.MetricsEnabled, int64(len(entries)))
+	if !gcRewrite {
+		y.NumPutsAdd(db.opt.MetricsEnabled, int64(len(entries)))
+	}
 
 	return req, nil
 }
@@ -1010,6 +1022,18 @@ func (db *DB) doWrites(lc *z.Closer) {
 //	Check(kv.BatchSet(entries))
 func (db *DB) batchSet(entries []*Entry) error {
 	req, err := db.sendToWriteCh(entries)
+	if err != nil {
+		return err
+	}
+
+	return req.Wait()
+}
+
+// batchSetGC writes back entries relocated by a vlog GC rewrite. It behaves
+// like batchSet but tags the request so the serialized vlog write path records
+// the entries' new locations in the active gcTracker.
+func (db *DB) batchSetGC(entries []*Entry) error {
+	req, err := db.sendToWriteChWithFlag(entries, true)
 	if err != nil {
 		return err
 	}
